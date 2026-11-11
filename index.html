@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>城市人群骨骼动画实例化演示</title>
+  <link rel="stylesheet" href="./src/styles.css">
+</head>
+<body>
+  <canvas id="scene" aria-label="城市人群三维场景"></canvas>
+
+  <section class="panel hud" aria-label="控制面板">
+    <div class="title-row">
+      <div>
+        <h1>城市人群骨骼动画</h1>
+        <p>共享低模网格与步行片段；每实例独立相位、速度、朝向和骨骼姿态。</p>
+      </div>
+      <span class="pill" id="modePill">实例化蒙皮</span>
+    </div>
+
+    <div class="control-grid">
+      <label class="range-label" for="countRange">
+        <span>角色数量</span>
+        <strong id="countLabel">160</strong>
+      </label>
+      <input id="countRange" type="range" min="1" max="512" step="1" value="160">
+      <div class="count-row">
+        <button id="removeOne" type="button">-1</button>
+        <input id="countInput" type="number" min="1" max="512" step="1" value="160" aria-label="角色数量输入">
+        <button id="addOne" type="button">+1</button>
+      </div>
+      <div class="preset-row" aria-label="规模预设">
+        <button data-count="64" type="button">64</button>
+        <button data-count="160" type="button">160</button>
+        <button data-count="320" type="button">320</button>
+        <button data-count="512" type="button">512</button>
+      </div>
+      <div class="button-row">
+        <button id="playPause" type="button">暂停</button>
+        <button id="resetCamera" type="button">重置相机</button>
+        <button id="runCheck" type="button">骨骼一致性检查</button>
+      </div>
+    </div>
+
+    <div id="checkResult" class="check-result">尚未运行检查。</div>
+  </section>
+
+  <section class="panel stats" aria-label="实测统计">
+    <h2>实测统计</h2>
+    <dl id="statsList"></dl>
+    <p class="note">统计来自当前设备的 renderer.info 与最近 120 帧计时，不假设固定帧率。</p>
+  </section>
+
+  <aside class="panel inspector" aria-label="角色检查器">
+    <div class="inspector-head">
+      <div>
+        <h2>单角色参考路径</h2>
+        <p>独立 SkinnedMesh + AnimationMixer + SkeletonHelper</p>
+      </div>
+      <select id="characterSelect" aria-label="选择角色"></select>
+    </div>
+    <canvas id="referenceView" width="360" height="250" aria-label="选中角色骨架参考视图"></canvas>
+    <dl id="selectedInfo" class="selected-info"></dl>
+    <div class="bone-table-wrap">
+      <table>
+        <thead>
+          <tr><th>骨骼</th><th>批处理模型坐标</th></tr>
+        </thead>
+        <tbody id="boneTable"></tbody>
+      </table>
+    </div>
+  </aside>
+
+  <div class="help">左键拖动旋转 / 滚轮缩放 / 点击角色选择</div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./node_modules/three/build/three.module.js",
+        "three/addons/": "./node_modules/three/examples/jsm/"
+      }
+    }
+  </script>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
