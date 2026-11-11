@@ -3,9 +3,17 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
   BONE_DEFINITIONS,
   CrowdPoseEvaluator,
+  SKELETON_DETAIL_DISTANCE_THRESHOLDS,
+  SKELETON_DETAIL_FULL,
+  SKELETON_DETAIL_HYSTERESIS,
+  SKELETON_DETAIL_LEVELS,
+  applyFullDetailBudget,
   createCharacterAssets,
   createReferenceCharacter,
-  getBonePositionFromMatrices
+  getBonePositionFromMatrices,
+  getSkeletonDetailMask,
+  getSkeletonDetailName,
+  selectSkeletonDetailLevel
 } from './character.js';
 import { createCity } from './city.js';
 
@@ -13,6 +21,7 @@ const MAX_COUNT = 512;
 const INITIAL_COUNT = 160;
 const LANE_COUNT = 9;
 const STATS_WINDOW = 120;
+const FULL_DETAIL_BUDGET = 192;
 const FOG_COLOR = new THREE.Color(0x9fb4c9);
 const FOG_NEAR = 34;
 const FOG_FAR = 92;
@@ -105,6 +114,11 @@ scene.add(crowdMesh);
 
 const instanceConfigs = createInstanceConfigs();
 const instanceTimes = evaluator.times;
+const instanceDetailLevels = new Uint8Array(MAX_COUNT);
+const instanceDetailBaseLevels = new Uint8Array(MAX_COUNT);
+const instanceDetailDistances = new Float64Array(MAX_COUNT);
+instanceDetailLevels.fill(SKELETON_DETAIL_FULL);
+instanceDetailBaseLevels.fill(SKELETON_DETAIL_FULL);
 const instanceColors = new Float32Array(MAX_COUNT * 3);
 const color = new THREE.Color();
 for (let i = 0; i < MAX_COUNT; i++) {
@@ -473,11 +487,13 @@ function animate(now) {
     referenceDirty = true;
   }
 
+  const controlsChanged = controls.update();
+  reference.controls.update();
+  if (controlsChanged) poseDirty = true;
+
   updateCrowd();
   updateSelectedSkeletonOverlay();
   if (referenceDirty) updateReferencePose();
-  controls.update();
-  reference.controls.update();
   const cpuMs = performance.now() - cpuStart;
   pushSample(cpuTimes, cpuMs);
 
@@ -514,10 +530,24 @@ function updateCrowd() {
   }
 
   if (poseDirty) {
+    const instanceMatrixArray = crowdMesh.instanceMatrix.array;
     for (let i = 0; i < activeCount; i++) {
+      const offset = i * 16;
+      const dx = instanceMatrixArray[offset + 12] - camera.position.x;
+      const dy = instanceMatrixArray[offset + 13] - camera.position.y;
+      const dz = instanceMatrixArray[offset + 14] - camera.position.z;
+      instanceDetailDistances[i] = Math.hypot(dx, dy, dz);
+      instanceDetailBaseLevels[i] = selectSkeletonDetailLevel(
+        instanceDetailDistances[i],
+        instanceDetailBaseLevels[i],
+        SKELETON_DETAIL_DISTANCE_THRESHOLDS,
+        SKELETON_DETAIL_HYSTERESIS
+      );
+      instanceDetailLevels[i] = instanceDetailBaseLevels[i];
       instanceTimes[i] = getAnimationTime(instanceConfigs[i]);
     }
-    evaluator.evaluate(instanceTimes, activeCount);
+    applyFullDetailBudget(instanceDetailLevels, instanceDetailDistances, activeCount, FULL_DETAIL_BUDGET);
+    evaluator.evaluate(instanceTimes, activeCount, instanceDetailLevels);
     boneTexture.needsUpdate = true;
     lastPoseUploads = 1;
     lastPoseMatrices = activeCount * assets.boneCount;
@@ -600,6 +630,11 @@ function updateSelectedInspector(force) {
   const time = getAnimationTime(config);
   const normalized = time / assets.clip.duration;
   const heading = getHeadingDegrees(config);
+  const detailLevel = instanceDetailLevels[selectedId];
+  const detailMask = getSkeletonDetailMask(detailLevel);
+  let animatedBones = 0;
+  for (let bone = 0; bone < assets.boneCount; bone++) animatedBones += detailMask[bone];
+  const binding = evaluator.getPoseBinding(selectedId);
 
   selectedInfo.innerHTML = `
     <dt>角色 ID</dt><dd>#${selectedId}</dd>
@@ -607,7 +642,9 @@ function updateSelectedInspector(force) {
     <dt>归一化相位</dt><dd>${normalized.toFixed(3)}</dd>
     <dt>动画速度</dt><dd>${config.animSpeed.toFixed(2)}×</dd>
     <dt>路径 / 朝向</dt><dd>lane ${config.lane} / ${heading.toFixed(1)}°</dd>
-    <dt>批处理行</dt><dd>bone texture row ${selectedId}</dd>
+    <dt>骨骼细节</dt><dd>${getSkeletonDetailName(detailLevel)}（${animatedBones}/${assets.boneCount} 骨骼动画）</dd>
+    <dt>批处理行</dt><dd>bone texture row ${binding.row}</dd>
+    <dt>相位绑定</dt><dd>${binding.time.toFixed(3)} s / ${getSkeletonDetailName(binding.detailLevel)}</dd>
   `;
 
   let rows = '';
@@ -627,6 +664,10 @@ function updateStats() {
   const renderP95 = percentile(renderTimes, 0.95);
   const fps = intervalAvg > 0 ? 1000 / intervalAvg : 0;
   const hardware = getHardwareInfo();
+  const detailCounts = getDetailLevelCounts();
+  const detailSummary = SKELETON_DETAIL_LEVELS
+    .map((level, index) => `${level.name} ${detailCounts[index]}`)
+    .join(' / ');
 
   statsList.innerHTML = `
     <dt>GPU</dt><dd title="${escapeHtml(hardware.gpu)}">${escapeHtml(hardware.gpu)}</dd>
@@ -638,10 +679,17 @@ function updateStats() {
     <dt>渲染提交</dt><dd>${renderAvg.toFixed(2)} ms avg, ${renderP95.toFixed(2)} ms p95</dd>
     <dt>主场景 draw calls</dt><dd>${mainDrawCalls}</dd>
     <dt>人群绘制</dt><dd>1 instanced draw / ${mainTriangles} tris total</dd>
+    <dt>骨骼细节层级</dt><dd>${detailSummary}（full 预算 ${FULL_DETAIL_BUDGET}）</dd>
     <dt>姿态上传</dt><dd>${lastPoseUploads} texture, ${lastPoseMatrices} matrices, ${formatBytes(lastPoseUploadBytes)}</dd>
     <dt>实例矩阵上传</dt><dd>${formatBytes(lastTransformUploadBytes)}</dd>
     <dt>参考视图 draw calls</dt><dd>${referenceDrawCalls}</dd>
   `;
+}
+
+function getDetailLevelCounts() {
+  const counts = new Array(SKELETON_DETAIL_LEVELS.length).fill(0);
+  for (let i = 0; i < activeCount; i++) counts[instanceDetailLevels[i]]++;
+  return counts;
 }
 
 function runIntegrityCheck() {
@@ -659,6 +707,8 @@ function runIntegrityCheck() {
   let maxIndexError = 0;
   let maxReferenceSkinError = 0;
   let maxInstanceIdError = 0;
+  let maxInheritanceError = 0;
+  let maxBindingError = 0;
   const signatures = new Set();
   const instanceIdAttribute = crowdMesh.geometry.getAttribute('aInstanceId');
   const referencePosition = new THREE.Vector3();
@@ -666,34 +716,66 @@ function runIntegrityCheck() {
   const expected = new THREE.Matrix4();
   const model = new THREE.Matrix4();
   const inverseBind = new THREE.Matrix4();
+  const restLocal = new THREE.Matrix4();
+  const inherited = new THREE.Matrix4();
+  const parentMatrix = new THREE.Matrix4();
 
   for (const id of sampleIds) {
-    maxInstanceIdError = Math.max(maxInstanceIdError, Math.abs(instanceIdAttribute.getX(id) - id));
+    const level = instanceDetailLevels[id];
+    const mask = getSkeletonDetailMask(level);
     const time = getAnimationTime(instanceConfigs[id]);
+    const binding = evaluator.getPoseBinding(id);
+    maxBindingError = Math.max(
+      maxBindingError,
+      Math.abs(binding.time - time),
+      Math.abs(binding.detailLevel - level),
+      Math.abs(binding.row - id)
+    );
+    maxInstanceIdError = Math.max(
+      maxInstanceIdError,
+      Math.abs(instanceIdAttribute.getX(id) - binding.row)
+    );
+
     reference.rig.mixer.setTime(time);
     reference.rig.mesh.updateMatrixWorld(true);
     reference.rig.skeleton.update();
 
     for (let bone = 0; bone < assets.boneCount; bone++) {
-      referencePosition.setFromMatrixPosition(reference.rig.bones[bone].matrixWorld);
-      getBonePositionFromMatrices(evaluator.modelBoneMatrices, id, bone, assets.boneCount, batchPosition);
-      maxBoneError = Math.max(maxBoneError, referencePosition.distanceTo(batchPosition));
-
       const matrixOffset = (id * assets.boneCount + bone) * 16;
-      model.fromArray(evaluator.modelBoneMatrices, matrixOffset);
-      inverseBind.fromArray(assets.rest.inverseBindMatrices, bone * 16);
-      expected.multiplyMatrices(model, inverseBind);
-      for (let element = 0; element < 16; element++) {
-        maxIndexError = Math.max(maxIndexError, Math.abs(expected.elements[element] - evaluator.skinMatrices[matrixOffset + element]));
-        maxReferenceSkinError = Math.max(
-          maxReferenceSkinError,
-          Math.abs(reference.rig.skeleton.boneMatrices[bone * 16 + element] - evaluator.skinMatrices[matrixOffset + element])
-        );
+      getBonePositionFromMatrices(evaluator.modelBoneMatrices, id, bone, assets.boneCount, batchPosition);
+
+      if (mask[bone] === 1) {
+        referencePosition.setFromMatrixPosition(reference.rig.bones[bone].matrixWorld);
+        maxBoneError = Math.max(maxBoneError, referencePosition.distanceTo(batchPosition));
+
+        model.fromArray(evaluator.modelBoneMatrices, matrixOffset);
+        inverseBind.fromArray(assets.rest.inverseBindMatrices, bone * 16);
+        expected.multiplyMatrices(model, inverseBind);
+        for (let element = 0; element < 16; element++) {
+          maxIndexError = Math.max(maxIndexError, Math.abs(expected.elements[element] - evaluator.skinMatrices[matrixOffset + element]));
+          maxReferenceSkinError = Math.max(
+            maxReferenceSkinError,
+            Math.abs(reference.rig.skeleton.boneMatrices[bone * 16 + element] - evaluator.skinMatrices[matrixOffset + element])
+          );
+        }
+      } else {
+        const parent = BONE_DEFINITIONS[bone].parent;
+        if (parent !== -1) {
+          restLocal.makeTranslation(
+            BONE_DEFINITIONS[bone].position[0],
+            BONE_DEFINITIONS[bone].position[1],
+            BONE_DEFINITIONS[bone].position[2]
+          );
+          parentMatrix.fromArray(evaluator.modelBoneMatrices, (id * assets.boneCount + parent) * 16);
+          inherited.multiplyMatrices(parentMatrix, restLocal);
+          referencePosition.set(inherited.elements[12], inherited.elements[13], inherited.elements[14]);
+          maxInheritanceError = Math.max(maxInheritanceError, batchPosition.distanceTo(referencePosition));
+        }
       }
     }
 
     getBonePositionFromMatrices(evaluator.modelBoneMatrices, id, 0, assets.boneCount, tmpVectorA);
-    getBonePositionFromMatrices(evaluator.modelBoneMatrices, id, 4, assets.boneCount, tmpVectorB);
+    getBonePositionFromMatrices(evaluator.modelBoneMatrices, id, 11, assets.boneCount, tmpVectorB);
     signatures.add(`${tmpVectorA.x.toFixed(4)},${tmpVectorA.y.toFixed(4)},${tmpVectorA.z.toFixed(4)}|${tmpVectorB.x.toFixed(4)},${tmpVectorB.y.toFixed(4)},${tmpVectorB.z.toFixed(4)}`);
   }
 
@@ -701,14 +783,16 @@ function runIntegrityCheck() {
   referenceDirty = true;
   updateReferencePose();
 
-  const pass = maxBoneError < 1e-3 && maxIndexError < 1e-5 && maxReferenceSkinError < 1e-3 && maxInstanceIdError === 0 && loopGap < 0.02 && signatures.size === sampleIds.length;
+  const pass = maxBoneError < 1e-3 && maxIndexError < 1e-5 && maxReferenceSkinError < 1e-3 && maxInstanceIdError === 0 && maxInheritanceError < 1e-3 && maxBindingError === 0 && loopGap < 0.02 && signatures.size === sampleIds.length;
   checkResult.className = `check-result ${pass ? 'pass' : 'fail'}`;
   checkResult.textContent = [
-    pass ? 'PASS：批处理姿态、独立参考路径和索引布局一致。' : 'FAIL：检测到姿态或索引不一致。',
-    `样本实例: ${sampleIds.map((id) => `#${id}`).join(', ')}`,
-    `最大骨骼位置误差: ${maxBoneError.toExponential(3)} m`,
+    pass ? 'PASS：批处理姿态、细节层级、独立参考路径和索引布局一致。' : 'FAIL：检测到姿态、细节层级或索引不一致。',
+    `样本实例: ${sampleIds.map((id) => `#${id}:${getSkeletonDetailName(instanceDetailLevels[id])}`).join(', ')}`,
+    `最大动画骨骼位置误差: ${maxBoneError.toExponential(3)} m`,
+    `非动画骨骼继承误差: ${maxInheritanceError.toExponential(3)} m`,
     `参考蒙皮矩阵误差: ${maxReferenceSkinError.toExponential(3)}`,
     `骨骼纹理索引误差: ${maxIndexError.toExponential(3)}`,
+    `实例相位绑定误差: ${maxBindingError.toExponential(3)}`,
     `实例 ID 属性误差: ${maxInstanceIdError.toExponential(3)}`,
     `循环边界最大跳变: ${loopGap.toExponential(3)} m`,
     `独立姿态签名: ${signatures.size}/${sampleIds.length}`

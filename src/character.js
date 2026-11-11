@@ -29,6 +29,142 @@ export const BONE_DEFINITIONS = [
 
 const BONE_COUNT = BONE_DEFINITIONS.length;
 const IDENTITY_QUATERNION = [0, 0, 0, 1];
+const BONE_DEPTHS = computeBoneDepths();
+
+export const SKELETON_DETAIL_FULL = 0;
+export const SKELETON_DETAIL_MEDIUM = 1;
+export const SKELETON_DETAIL_COARSE = 2;
+export const SKELETON_DETAIL_LEVELS = [
+  { name: 'full', maxDepth: Number.POSITIVE_INFINITY },
+  { name: 'medium', maxDepth: 3 },
+  { name: 'coarse', maxDepth: 1 }
+];
+export const SKELETON_DETAIL_DISTANCE_THRESHOLDS = [34, 60];
+export const SKELETON_DETAIL_HYSTERESIS = 2.5;
+
+const SKELETON_DETAIL_MASKS = SKELETON_DETAIL_LEVELS.map((level) => {
+  const mask = new Uint8Array(BONE_COUNT);
+  for (let bone = 0; bone < BONE_COUNT; bone++) {
+    mask[bone] = BONE_DEPTHS[bone] <= level.maxDepth ? 1 : 0;
+  }
+  return mask;
+});
+
+function computeBoneDepths() {
+  const depths = new Int8Array(BONE_COUNT).fill(-1);
+
+  const resolveDepth = (boneIndex, visiting) => {
+    if (depths[boneIndex] >= 0) return depths[boneIndex];
+    if (visiting[boneIndex]) throw new Error(`Cyclic bone hierarchy at ${BONE_DEFINITIONS[boneIndex].name}`);
+    visiting[boneIndex] = 1;
+    const parent = BONE_DEFINITIONS[boneIndex].parent;
+    if (parent !== -1 && (parent < 0 || parent >= BONE_COUNT)) {
+      throw new Error(`Invalid parent for bone ${BONE_DEFINITIONS[boneIndex].name}`);
+    }
+    depths[boneIndex] = parent === -1 ? 0 : resolveDepth(parent, visiting) + 1;
+    visiting[boneIndex] = 0;
+    return depths[boneIndex];
+  };
+
+  const visiting = new Uint8Array(BONE_COUNT);
+  for (let bone = 0; bone < BONE_COUNT; bone++) resolveDepth(bone, visiting);
+  return depths;
+}
+
+export function getSkeletonDetailMask(detailLevel) {
+  assertDetailLevel(detailLevel);
+  return SKELETON_DETAIL_MASKS[detailLevel];
+}
+
+export function getSkeletonDetailName(detailLevel) {
+  assertDetailLevel(detailLevel);
+  return SKELETON_DETAIL_LEVELS[detailLevel].name;
+}
+
+export function getSkeletonDetailLevelForDistance(
+  distance,
+  thresholds = SKELETON_DETAIL_DISTANCE_THRESHOLDS
+) {
+  if (!Number.isFinite(distance) || distance < 0) {
+    throw new RangeError(`Skeleton detail distance must be a finite non-negative number, got ${distance}`);
+  }
+  assertDetailThresholds(thresholds);
+  let detailLevel = 0;
+  while (detailLevel < thresholds.length && distance >= thresholds[detailLevel]) detailLevel++;
+  return detailLevel;
+}
+
+export function selectSkeletonDetailLevel(
+  distance,
+  currentLevel = -1,
+  thresholds = SKELETON_DETAIL_DISTANCE_THRESHOLDS,
+  hysteresis = SKELETON_DETAIL_HYSTERESIS
+) {
+  const pureLevel = getSkeletonDetailLevelForDistance(distance, thresholds);
+  if (currentLevel === null || currentLevel === undefined || currentLevel === -1) return pureLevel;
+  assertDetailLevel(currentLevel);
+  if (!Number.isFinite(hysteresis) || hysteresis < 0) {
+    throw new RangeError(`Skeleton detail hysteresis must be a finite non-negative number, got ${hysteresis}`);
+  }
+  if (pureLevel === currentLevel) return currentLevel;
+
+  const halfBand = hysteresis * 0.5;
+  if (pureLevel > currentLevel) {
+    const enterCoarser = thresholds[currentLevel] + halfBand;
+    return distance >= enterCoarser ? pureLevel : currentLevel;
+  }
+
+  const exitCoarser = thresholds[currentLevel - 1] - halfBand;
+  return distance <= exitCoarser ? pureLevel : currentLevel;
+}
+
+export function applyFullDetailBudget(levels, distances, activeCount, fullDetailBudget) {
+  if (!Number.isInteger(activeCount) || activeCount < 0 || activeCount > levels.length || activeCount > distances.length) {
+    throw new RangeError(`Invalid budget activeCount ${activeCount}`);
+  }
+  if (!Number.isInteger(fullDetailBudget) || fullDetailBudget < 0) {
+    throw new RangeError(`Invalid full-detail budget ${fullDetailBudget}`);
+  }
+
+  const candidates = [];
+  for (let instance = 0; instance < activeCount; instance++) {
+    assertDetailLevel(levels[instance]);
+    if (!Number.isFinite(distances[instance]) || distances[instance] < 0) {
+      throw new RangeError(`Invalid skeleton detail distance at instance ${instance}`);
+    }
+    if (levels[instance] === SKELETON_DETAIL_FULL) candidates.push(instance);
+  }
+
+  let demoted = 0;
+  if (candidates.length <= fullDetailBudget) return demoted;
+  candidates.sort((a, b) => distances[b] - distances[a] || b - a);
+  const excess = candidates.length - fullDetailBudget;
+  for (let i = 0; i < excess; i++) {
+    levels[candidates[i]] = SKELETON_DETAIL_MEDIUM;
+    demoted++;
+  }
+  return demoted;
+}
+
+function assertDetailLevel(detailLevel) {
+  if (!Number.isInteger(detailLevel) || detailLevel < 0 || detailLevel >= SKELETON_DETAIL_LEVELS.length) {
+    throw new RangeError(`Unknown skeleton detail level ${detailLevel}`);
+  }
+}
+
+function assertDetailThresholds(thresholds) {
+  if (!Array.isArray(thresholds) || thresholds.length !== SKELETON_DETAIL_LEVELS.length - 1) {
+    throw new RangeError('Skeleton detail thresholds must match the number of detail transitions');
+  }
+  for (let i = 0; i < thresholds.length; i++) {
+    if (!Number.isFinite(thresholds[i]) || thresholds[i] < 0) {
+      throw new RangeError(`Invalid skeleton detail threshold at index ${i}`);
+    }
+    if (i > 0 && thresholds[i] <= thresholds[i - 1]) {
+      throw new RangeError('Skeleton detail thresholds must be strictly ascending');
+    }
+  }
+}
 
 export function createCharacterAssets() {
   const rest = computeRestSkeleton();
@@ -215,6 +351,14 @@ export class CrowdPoseEvaluator {
     this.localMatrix = new Float32Array(16);
     this.quaternionTracks = [];
     this.vectorTracks = [];
+    this.poseTimes = new Float64Array(capacity);
+    this.poseLevels = new Uint8Array(capacity);
+    this.poseRowByInstance = new Uint32Array(capacity);
+    this.defaultDetailLevels = new Uint8Array(capacity);
+    for (let instance = 0; instance < capacity; instance++) {
+      this.poseRowByInstance[instance] = instance;
+      this.defaultDetailLevels[instance] = SKELETON_DETAIL_FULL;
+    }
 
     const boneIndexByName = new Map(assets.boneDefinitions.map((bone, index) => [bone.name, index]));
     for (const track of assets.clip.tracks) {
@@ -232,18 +376,52 @@ export class CrowdPoseEvaluator {
     }
   }
 
-  evaluate(times, activeCount) {
+  evaluate(times, activeCount, detailLevels = null) {
+    if (!Number.isInteger(activeCount) || activeCount < 0 || activeCount > this.capacity) {
+      throw new RangeError(`Evaluate count ${activeCount} exceeds capacity ${this.capacity}`);
+    }
+    if (times.length < activeCount) {
+      throw new RangeError(`Expected at least ${activeCount} animation times, got ${times.length}`);
+    }
+    const levels = detailLevels === null ? this.defaultDetailLevels : detailLevels;
+    if (levels.length < activeCount) {
+      throw new RangeError(`Expected at least ${activeCount} detail levels, got ${levels.length}`);
+    }
+
+    for (let instance = 0; instance < activeCount; instance++) {
+      const time = times[instance];
+      const level = levels[instance];
+      if (!Number.isFinite(time)) {
+        throw new RangeError(`Animation time for instance ${instance} is not finite: ${time}`);
+      }
+      assertDetailLevel(level);
+      this.poseTimes[instance] = time;
+      this.poseLevels[instance] = level;
+      this.poseRowByInstance[instance] = instance;
+    }
+
     this.resetLocalPose(activeCount);
 
     for (const track of this.quaternionTracks) {
-      sampleQuaternionTrack(track, times, activeCount, this.localQuaternions, this.boneCount);
+      sampleQuaternionTrack(track, times, activeCount, this.localQuaternions, this.boneCount, levels);
     }
 
     for (const track of this.vectorTracks) {
-      sampleVectorTrack(track, times, activeCount, this.localPositions, this.boneCount);
+      sampleVectorTrack(track, times, activeCount, this.localPositions, this.boneCount, levels);
     }
 
     this.composePose(activeCount);
+  }
+
+  getPoseBinding(instance) {
+    if (!Number.isInteger(instance) || instance < 0 || instance >= this.capacity) {
+      throw new RangeError(`Invalid pose binding instance ${instance}`);
+    }
+    return {
+      row: this.poseRowByInstance[instance],
+      time: this.poseTimes[instance],
+      detailLevel: this.poseLevels[instance]
+    };
   }
 
   resetLocalPose(activeCount) {
@@ -320,12 +498,13 @@ export class CrowdPoseEvaluator {
   }
 }
 
-function sampleQuaternionTrack(track, times, activeCount, target, boneCount) {
+function sampleQuaternionTrack(track, times, activeCount, target, boneCount, detailLevels) {
   const trackTimes = track.times;
   const trackValues = track.values;
   const lastIndex = trackTimes.length - 1;
 
   for (let instance = 0; instance < activeCount; instance++) {
+    if (SKELETON_DETAIL_MASKS[detailLevels[instance]][track.boneIndex] === 0) continue;
     const time = wrapTime(times[instance], trackTimes[lastIndex]);
     const keyIndex = findKeyframe(trackTimes, time);
     const nextIndex = Math.min(keyIndex + 1, lastIndex);
@@ -346,12 +525,13 @@ function sampleQuaternionTrack(track, times, activeCount, target, boneCount) {
   }
 }
 
-function sampleVectorTrack(track, times, activeCount, target, boneCount) {
+function sampleVectorTrack(track, times, activeCount, target, boneCount, detailLevels) {
   const trackTimes = track.times;
   const trackValues = track.values;
   const lastIndex = trackTimes.length - 1;
 
   for (let instance = 0; instance < activeCount; instance++) {
+    if (SKELETON_DETAIL_MASKS[detailLevels[instance]][track.boneIndex] === 0) continue;
     const time = wrapTime(times[instance], trackTimes[lastIndex]);
     const keyIndex = findKeyframe(trackTimes, time);
     const nextIndex = Math.min(keyIndex + 1, lastIndex);

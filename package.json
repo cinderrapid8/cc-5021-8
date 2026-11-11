@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "verify": "node scripts/verify.mjs"
+    "verify": "node scripts/verify.mjs",
+    "verify:crowd": "node scripts/crowd-hierarchy-regression.mjs",
+    "verify:all": "node scripts/verify.mjs && node scripts/crowd-hierarchy-regression.mjs"
   },
   "dependencies": {
     "three": "0.160.0"
